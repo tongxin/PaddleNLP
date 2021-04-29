@@ -175,178 +175,109 @@ def einsum(equation, *operands):
         result = paddle.transpose(result, output_perm)
         return result
 
+    def expand_eqn_lhs(lhs, operands):
+        '''
+        Parse the left hand side of the input equation, returning expanded subscripts 
+        for each input operand, where the subscripts' length equals the operand tensor's rank.
+        Along with subscripts string, the number of ellipsis dimensions is also returned 
+        '''
+        op_eqn_list = lhs.split(',') # operand_eqns = input_eqn.split(",")
+        # Sanity checks 
+        assert all(c == '.' or c == ',' for c in lhs if not c.isapha()) "Invalid equation: no special characters other than ',' and '.' are allowed in the equation."
+        assert len(op_eqn_list) == len(operands) "Invalid equation: the subscripts groups do not match the number of input operands."
+        assert any(not s for s in op_eqn_list) "Invalid equation: subscripts split by ',' got empty strings."
+        # Expand the equation for each input operand 
+        for eqn, op in zip(op_eqn_list, operands):
+            dot_pos, ell_pos = eqn.find('.'), eqn.find('...')
+            # Note, the order of the following two asserts matters
+            assert dot_pos == ell_pos "Invalid equation: equation includes '.' but no '...'."
+            assert ell_pos >= 0 and eqn.find('.', ell_pos+3) < 0 "Invalid equation: equation includes '.' behind '...'."
+            op_rank = int(op.rank().numpy())
+            ell_rank = 0
+            if ell_pos >= 0:
+                ell_rank = op_rank - len(eqn) + 3
+                op_subscripts = ('.' * ell_rank).join(eqn.split('...'))
+            # return a tuple of expanded subscripts, ellipsis masked rank for each operand
+            yield op_subscripts, ell_rank
+
+    def expand_eqn_rhs(eqn, ell=False):
+        # Sanity check. only alphabet is allowed if not '.'
+        assert all(c == '.' for c in eqn if not c.isalpha()) "Invalid equation: non-alphabet char is found other than '.'."
+        
+        # Syntax sanity check
+        dot_pos, ell_pos = rhs.find('.'), eqn.find('...')
+        assert dot_pos == ell_pos "Invalid equation: equation includes '.' but no '...'."
+        assert ell_pos >= 0 and eqn.find('.', ell_pos+3) < 0 "Invalid equation: equation includes '.' behind '...'."
+
+        out_subscripts = eqn
+        if ell:
+            # None-zero ell_rank value implies non-zero hidden output dimensions, 
+            # and that in turn requires including an '...' in rhs in case rhs is provided.
+            assert ell_pos >= 0 "Invalid equation: output has more dimensions than what rhs provides, missing '...'."
+            out_subscripts = '.'.join(eqn.split('...')
+        return out_subscripts
+
+    def join(x_subs, x, y_subs, y, out_subs=out_subscripts):
+        '''
+        Joins two tensor operands. The out_subs is referenced for querying output subscripts and their order
+
+        For each input operand, a dimension falls into 4 categories based on its subscript's properties:
+        - subscript is shared and in output
+        - subscript is shared and not in output
+        - subscript is not shared, and in output
+        - subscript is not shared, and not in output
+
+        For not shared and not output subscripts, the dimensions will be reduced first.
+        After that local reduction step, all operand tensors are permuted into shape
+        [batch_dims..., index_dims..., sum_dims...], where
+        batch_dims... are dimensions with shared *and* output subscripts,
+        index_dims... dimensions with output and not shared subscripts,
+        sum_dims... dimensions with shared and not output subscripts
+
+        For all shared dimensions, their size and order must be consistent.
+        The operation cannot proceed if there's inconsistent dimensions
+
+        Finally, the summed result is returned along with its dimension subscripts
+        '''        
+
     if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
         operands = operands[0]
     # Equation is case insensitive
-    num_letters = 26
-    letters_to_idx = [-1] * num_letters
     equation = equation.lower().replace(' ', '')
     # 1. Parse the equation
-    eqns = equation.split("->")
-    num_eqns_size = len(eqns)
-    assert num_eqns_size <= 2, "The '->' should exist at most only once"
+    lhs, *rhs = equation.split('->') # eqns = equation.split("->")
+    assert len(rhs) < 2, " Invalid equation: multiple `->` were found."
+    rhs = rhs[0] if rhs else ''
+    # Parse the input equation
+    op_subscripts_list = list(expand_eqn_lhs(lhs, operands))
+    # TODO: diagnalize 
 
-    input_eqn = eqns[0]
-    output_eqn = None if num_eqns_size <= 1 else eqns[1]
-    operand_eqns = input_eqn.split(",")
-    assert len(operand_eqns) == len(
-        operands
-    ), "Number of operands in equation and the tensors provided should be equal."
+    # collect the set of subscripts not shared across operands and build initial output subscripts
+    subscript_count = dict()
+    for op_subs in op_subscripts_list:
+        for ch in set(op_subs):
+            subscript_count[ch]++
+    outset = set(ch for ch in subscript_count if subscript_count[ch] == 1)
+    out_subscripts = ''.join(outset)
+    if rhs:
+        # check output subscripts must appear in the left hand side of the equation
+        output_chars = set(rhs).remove('.')
+        assert all(lhs.find(ch) >= 0 for ch in output_chars)
+            "Invalid equation: subscripts in right hand side of the equation must appear in the left hand side."
+        # check no subscripts appear more than once 
+        assert all(rhs.count(ch) == 1 for ch in output_chars)
+            "Invalid equation: right hand side includes the same subscript multiple times."
+        ell_found = any(r > 0 for _, r in op_subscripts_list)
+        out_subscripts = expand_eqn_rhs(rhs, ell_found)
 
-    # Parse input equation
-    num_total_idxes = 0
-    input_operand_idxes = []
-    letter_frequence = [0] * num_letters
-    idxes_last_operand = []
-    num_ell_idxes = -1
-    first_ell_idx = 0
-    for i, term in enumerate(operand_eqns):
-        ell_char_count = 0
-        operand_rank = int(operands[i].rank().numpy())
-        curr_num_ell_idxes = operand_rank - len(term) + 3
-        dims_in_terms = 0
-        curr_operand_idxes = []
-        for ch in term:
-            if ch == '.':
-                ell_char_count += 1
-                assert ell_char_count <= 3, "The '.' should only exist in one ellispis '...' in term {}".format(
-                    term)
-                if ell_char_count == 3:
-                    if num_ell_idxes == -1:
-                        num_ell_idxes = curr_num_ell_idxes
-                        first_ell_idx = num_total_idxes
-                        num_total_idxes += num_ell_idxes
-                    else:
-                        assert curr_num_ell_idxes == num_ell_idxes, "Ellispis in all terms should represent same dimensions ({}).".format(
-                            num_ell_idxes)
-
-                    for j in range(num_ell_idxes):
-                        curr_operand_idxes.append(j + first_ell_idx)
-                        idxes_last_operand.append(i)
-                    dims_in_terms += num_ell_idxes
-            else:
-                assert (
-                    (ell_char_count == 0) or (ell_char_count == 3)
-                ), "'.' must only occur in ellipsis, operand {}".format(term)
-                assert (ord('a') <= ord(ch) and
-                        ord(ch) <= ord('z')), "only accept alphabet (a-zA-Z)"
-                letter_num = ord(ch) - ord('a')
-                if letters_to_idx[letter_num] == -1:
-                    letters_to_idx[letter_num] = num_total_idxes
-                    num_total_idxes += 1
-                    idxes_last_operand.append(i)
-                else:
-                    idxes_last_operand[letters_to_idx[letter_num]] = i
-                letter_frequence[letter_num] += 1
-                curr_operand_idxes.append(letters_to_idx[letter_num])
-                dims_in_terms += 1
-
-        assert dims_in_terms == operand_rank, "Dimension dismatch for operand {}: equation {}, tensor {}".format(
-            i, dims_in_terms, operand_rank)
-        input_operand_idxes.append(curr_operand_idxes)
-    # Parse output equation
-    idxes_to_output_dims = [-1] * num_total_idxes
-    num_output_dims = 0
-    if num_eqns_size == 2:
-        ell_char_count = 0
-        for ch in output_eqn:
-            if ch == '.':
-                ell_char_count += 1
-                assert ell_char_count <= 3, "The '.' should only exist in one ellispis '...' in term {}".format(
-                    output_eqn)
-                if ell_char_count == 3:
-                    assert num_ell_idxes > -1, "Input equation '{}' don't have ellispis.".format(
-                        input_eqn)
-                    for j in range(num_ell_idxes):
-                        idxes_to_output_dims[first_ell_idx +
-                                             j] = num_output_dims
-                        num_output_dims += 1
-
-            else:
-                assert ((ell_char_count == 0) or (ell_char_count == 3)
-                        ), "'.' must only occur in ellipsis, operand {}".format(
-                            output_eqn)
-                assert (ord('a') <= ord(ch) and
-                        ord(ch) <= ord('z')), "only accept alphabet (a-zA-Z)"
-                letter_num = ord(ch) - ord('a')
-                assert letters_to_idx[
-                    letter_num] != -1, "character {} doesn't exist in input".format(
-                        ch)
-                assert idxes_to_output_dims[letters_to_idx[
-                    letter_num]] == -1, "character {} occurs twice in output".format(
-                        ch)
-
-                idxes_to_output_dims[letters_to_idx[
-                    letter_num]] = num_output_dims
-                num_output_dims += 1
-    else:  #  num_eqns_size == 1
-        # Infer the output dims
-        if num_ell_idxes >= 0:
-            for j in range(num_ell_idxes):
-                idxes_to_output_dims[first_ell_idx + j] = num_output_dims
-                num_output_dims += 1
-        for j in range(num_letters):
-            if letter_frequence[j] == 1:
-                idxes_to_output_dims[letters_to_idx[j]] = num_output_dims
-                num_output_dims += 1
-
-    # Mark sum index
-    sum_dim = num_output_dims
-    for i in range(num_total_idxes):
-        if idxes_to_output_dims[i] == -1:
-            idxes_to_output_dims[i] = sum_dim
-            sum_dim += 1
-
-    preprocessed_operands = []
-    size_dims = [-1] * num_total_idxes
-    for i, preprocessed_operand in enumerate(operands):
-        idx_to_dims = [-1] * num_total_idxes
-        curr_operand_idxes = input_operand_idxes[i]
-        dim = 0
-        for j, idx in enumerate(curr_operand_idxes):
-            output_dim = idxes_to_output_dims[idx]
-            if idx_to_dims[output_dim] == -1:
-                idx_to_dims[output_dim] = dim
-                if size_dims[idx] == -1:
-                    size_dims[idx] = preprocessed_operand.shape[dim]
-                else:
-                    assert size_dims[idx] == preprocessed_operand.shape[
-                        dim], "Dimension size does not match previous size. "
-                dim += 1
-            else:
-                # Diagonal repeated index
-                # TODO(zhoushunjie): Need to develop a paddle.diagonal api
-                raise NotImplementedError("Can't support diagonal.")
-        perm = []
-        for input_dim in idx_to_dims:
-            if input_dim > -1:
-                perm.append(input_dim)
-        # Transpose the tensor by perm
-        preprocessed_operand = paddle.transpose(preprocessed_operand, perm=perm)
-
-        for dim, input_dim in enumerate(idx_to_dims):
-            if input_dim == -1:
-                preprocessed_operand = paddle.unsqueeze(preprocessed_operand,
-                                                        dim)
-
-        preprocessed_operands.append(preprocessed_operand)
-
-    # 2. Execute the mul_sum
-    sum_dims = []
-    result = preprocessed_operands[0]
-    for i in range(num_total_idxes):
-        if idxes_last_operand[i] == 0 and idxes_to_output_dims[
-                i] >= num_output_dims:
-            result = result.sum(axis=idxes_to_output_dims[i], keepdim=True)
-    for i in range(1, len(preprocessed_operands)):
-        for j in range(num_total_idxes):
-            if idxes_last_operand[j] == i and idxes_to_output_dims[
-                    j] >= num_output_dims:
-                sum_dims.append(idxes_to_output_dims[j])
-        result = _mul_sum(result, preprocessed_operands[i], sum_dims)
-
-    squeeze_dims = [
-        i for i in range(len(result.shape) - 1, num_output_dims - 1, -1)
-    ]
-    result = paddle.squeeze(result, squeeze_dims)
+    # Actions start here. Sum up the operands following certain order 
+    # which is up to an optional order decision algorithm
+    work_queue = list()
+    for op_subs, op in zip(op_subscripts_list, operands):
+        work_queue.append([op_subs, op])
+    
+    subscripts, result = work_queue.pop()
+    while work_queue:
+        subscripts, result = join(subscripts, result, *work_queue.pop())
+    
     return result
