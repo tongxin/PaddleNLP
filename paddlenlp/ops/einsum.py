@@ -16,6 +16,29 @@ import paddle
 
 __all__ = ['einsum']
 
+def join(x_subs, x, y_subs, y, out_subs=out_subscripts):
+    '''
+        Joins two tensor operands. The out_subs is referenced for querying output subscripts and their order
+
+        For each input operand, a dimension falls into 4 categories based on its subscript's properties:
+        - subscript is shared and in output
+        - subscript is shared and not in output
+        - subscript is not shared, and in output
+        - subscript is not shared, and not in output
+
+        For not shared and not output subscripts, the dimensions will be reduced first.
+        After that local reduction step, all operand tensors are permuted into shape
+        [batch_dims..., index_dims..., sum_dims...], where
+        batch_dims... are dimensions with shared *and* output subscripts,
+        index_dims... dimensions with output and not shared subscripts,
+        sum_dims... dimensions with shared and not output subscripts
+
+        For all shared dimensions, their size and order must be consistent.
+        The operation cannot proceed if there's inconsistent dimensions
+
+        Finally, the summed result is returned along with its dimension subscripts
+        '''
+
 
 def einsum(equation, *operands):
     r"""
@@ -25,12 +48,13 @@ def einsum(equation, *operands):
 
     Args:
         equation (`str`):
-            Uses uncased letters to specify the dimension of the operands and result. The input
-            equation is on the left hand before `->` while the output equation is on the right side.
-            Einsum can infer the result shape so that the `->` and the result label letters can be omitted.
-            Operands in the input equation are splited by commas (','), e.g. 'abc,cde' describes two 3D
-            operands. The dimensions labeled with same letter should be same or be 1. Ellipsis ('...') can
-            be used to specify the broadcast dimensions.
+            The equation uses uncased letters to specify the dimensions for summation and output. 
+            These letters are called dimension labels or dimension subscripts. The dimension labels 
+            are comma separated corresponding to all the input operands. The equation uses `->` to indicate 
+            explicitly the output dimensions which otherwise would be collapsed as the result of summation.
+            In case the explicit output is not given, Einsum will deduce the output dimensions automatically.
+            Dimensions with the same label should be broadcastable. The equation uses ellipsis ('...') to 
+            specify broadcast dimensions.
 
         operands (`Tensor`):
             The operands to compute the Einstein sum of. The number of operands should be the same as the
@@ -217,28 +241,6 @@ def einsum(equation, *operands):
             out_subscripts = '.'.join(eqn.split('...')
         return out_subscripts
 
-    def join(x_subs, x, y_subs, y, out_subs=out_subscripts):
-        '''
-        Joins two tensor operands. The out_subs is referenced for querying output subscripts and their order
-
-        For each input operand, a dimension falls into 4 categories based on its subscript's properties:
-        - subscript is shared and in output
-        - subscript is shared and not in output
-        - subscript is not shared, and in output
-        - subscript is not shared, and not in output
-
-        For not shared and not output subscripts, the dimensions will be reduced first.
-        After that local reduction step, all operand tensors are permuted into shape
-        [batch_dims..., index_dims..., sum_dims...], where
-        batch_dims... are dimensions with shared *and* output subscripts,
-        index_dims... dimensions with output and not shared subscripts,
-        sum_dims... dimensions with shared and not output subscripts
-
-        For all shared dimensions, their size and order must be consistent.
-        The operation cannot proceed if there's inconsistent dimensions
-
-        Finally, the summed result is returned along with its dimension subscripts
-        '''        
 
     if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
         operands = operands[0]
