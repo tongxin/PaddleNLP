@@ -16,28 +16,152 @@ import paddle
 
 __all__ = ['einsum']
 
-def join(x_subs, x, y_subs, y, out_subs=out_subscripts):
+def extract_op_labels(lhs, operands):
     '''
-        Joins two tensor operands. The out_subs is referenced for querying output subscripts and their order
+    Used a generator to extract the labels, op pair for each operand.  
+    '''
+    op_labels_list = lhs.split(',')
+    # Sanity checks
+    assert len(op_labels_list) == len(operands), "Invalid equation: the input labels do not match the number of input operands."
+    assert any(not labels for labels in op_labels_list), "Invalid equation: subscripts split by ',' got empty strings."
+    # yields a pair of labels, operand
+    yield from zip(op_labels_list, operands)
 
-        For each input operand, a dimension falls into 4 categories based on its subscript's properties:
-        - subscript is shared and in output
-        - subscript is shared and not in output
-        - subscript is not shared, and in output
-        - subscript is not shared, and not in output
+def parse_input_labels(labels, operand):
+    '''
+    Parses the dimension labels for an input operand.
+    Returns labels extended on all the dimensions, dots denoting implicit labels 
+    '''
+    # Sanity checks
+    assert all(c in '.' or c.isalpha() for c in labels), f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
+    # Expand the labels
+    op_rank = len(op.shape) # Note, in Paddle a tensor rank is always nonzero
+    assert op_rank > 0
 
-        For not shared and not output subscripts, the dimensions will be reduced first.
-        After that local reduction step, all operand tensors are permuted into shape
-        [batch_dims..., index_dims..., sum_dims...], where
-        batch_dims... are dimensions with shared *and* output subscripts,
-        index_dims... dimensions with output and not shared subscripts,
-        sum_dims... dimensions with shared and not output subscripts
+    dot_pos = labels.find('.')
+    if dot_pos == -1:
+        # No ellipsis, implying the labels should straightly match the operand dimensions
+        assert len(labels) == op_rank, f"Invalid equation: missing labels for input operand '{operand.name}''."
+        extended_labels = labels
+    if dot_pos >= 0:
+        ell_pos, extra_dot = labels.find('...', dot_pos), labels.find('...', dot_pos+3)  
+        # Note, the order of the following two asserts matters
+        assert dot_pos == ell_pos, "Invalid equation: ellipsis is expected but not found."
+        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
+        assert len(labels) - 3 <= op_rank, "Invalid equation: more labels are found than the available dimensions in operand '{operand.name}'."
+        ell_rank = op_rank - len(labels) + 3
+        extended_labels = ('.' * ell_rank).join(labels.split('...'))
+        # return a tuple of expanded subscripts, ellipsis masked rank for each operand
+    # Do we need to handle at this point the trace and diag cases
+    return extended_labels
 
-        For all shared dimensions, their size and order must be consistent.
-        The operation cannot proceed if there's inconsistent dimensions
+def has_implicit_dims(extended_labels):
+    '''
+    Returns whether there are non-labeled dimensions by checking the extended labels 
+    '''
+    return '.' in extended_labels
 
-        Finally, the summed result is returned along with its dimension subscripts
-        '''
+def get_implicit_dim_indices_and_shape(op_shape, extended_labels):
+    '''
+    Returns the shape of the implicit dimensions indicated by the extended labels
+    '''
+    assert len(op_shape) == len(extended_labels)
+
+    indices, shape = [], []
+    for i, size, label in zip(range(len(op_shape)), op_dims, extended_labels):
+        if label == '.':
+            indices.append(i);
+            shape.append(size)    
+        
+    return indices, shape
+
+def broadcastable(x_shape, y_shape):
+    if not isinstance(x_shape, list):
+        assert not isinstance(y_shape, list)
+        x_size, y_size = int(x_shape), int(y_shape)
+        assert (not x_size == 0) and (not y_size == 0), "Invalid equation: empty dimension cannot be broadcasted. " 
+        return x_size == 1 or y_size == 1 or x_size == y_size
+
+    if len(x_shape) == len(y_shape):
+        if len(x_shape) == 0:
+            return True
+        res = broadcastable(x_shape.pop(), x_shape.pop()) and broadcastable(x_shape, y_shape)
+        return res
+    
+    if len(x_shape) < len(y_shape):
+        x_shape, y_shape = y_shape, x_shape
+
+    # Try unsqueeze y's dimensions to the left and then to the right
+    x_shape_l, x_shape_r = x_shape[:-1], x_shape[1:]
+    res = broadcastable(x_shape_l, y_shape) or broadcastable(x_shape_r, y_shape) 
+    return res
+
+def collect_avail_labels(labels_list):
+    '''
+    Returns the union of all available labels in the list
+    '''
+    label_set = set()
+    for labels in labels_list):
+        label_set = label_set.update(labels)
+    
+    return ''.join(label_set)
+
+def parse_explicit_output_labels(rhs, avail_labels):
+    '''
+    Parse explicit output labels given on the right hand side of '->' and the available input labels
+    Returns the output labels in a string
+    '''
+    # Sanity check. Only alphabet is allowed if not '.'
+    assert all(c in avail_labels for c in rhs), f"Invalid equation: an output label is expected to be included in the input labels but `{c}` is found."
+    
+    if '.' in avail_labels:
+        # Syntax sanity check. Verify that dots exist if and only if they show up in an ellipsis
+        dot_pos = rhs.find('.')
+        assert ell_pos >= 0, "Invalid equation: more output dimensions should be provided, missing '...'."
+        ell_pos, extra_dot = rhs.find('...', dot_pos), rhs.find('.', dot_pos+3)
+        assert ell_pos == dot_pos, "Invalid equation: ellipsis is expected but not found."
+        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
+        out_labels = '.'.join(rhs.split('...')
+    else:
+        out_labels = rhs
+
+    # Syntax sanity check. Verify there's no duplicate labels
+    label_list = []
+    for c in out_labels:
+        assert not c in label_list, f"Invalid equation: duplicate output label {c}."
+        label_list.append(c)
+    return out_labels
+
+def infer_output_labels(eqn):
+    '''
+    Infer output labels in case no explicit output labels are given on the right hand side of '->' 
+    Returns the output labels in a string
+    '''
+    pass
+
+def join(x, y, xlabels, ylabels, out_labels):
+    '''
+    Joins two tensor operands x and y following the input and output labels
+    Returns [tensor, dimension labels] pair
+
+    For each input operand, a dimension falls into 4 categories based on its subscript's properties:
+    - subscript is shared and in output
+    - subscript is shared and not in output
+    - subscript is not shared, and in output
+    - subscript is not shared, and not in output
+
+    For not shared and not output subscripts, the dimensions will be reduced first.
+    After that local reduction step, all operand tensors are permuted into shape
+    [batch_dims..., index_dims..., sum_dims...], where
+    batch_dims... are dimensions with shared *and* output subscripts,
+    index_dims... dimensions with output and not shared subscripts,
+    sum_dims... dimensions with shared and not output subscripts
+
+    For all shared dimensions, their size and order must be consistent.
+    The operation cannot proceed if there's inconsistent dimensions
+
+    Finally, the summed result is returned along with its dimension subscripts
+    '''
 
 
 def einsum(equation, *operands):
@@ -48,9 +172,9 @@ def einsum(equation, *operands):
 
     Args:
         equation (`str`):
-            The equation uses uncased letters to specify the dimensions for summation and output. 
-            These letters are called dimension labels or dimension subscripts. The dimension labels 
-            are comma separated corresponding to all the input operands. The equation uses `->` to indicate 
+            The equation uses uncased letters to indicate the dimensions for summation. 
+            These letters are called dimension labels or dimension subscripts. The dimension labels
+            are comma separated to correspond to all the input operands. The equation uses `->` to indicate 
             explicitly the output dimensions which otherwise would be collapsed as the result of summation.
             In case the explicit output is not given, Einsum will deduce the output dimensions automatically.
             Dimensions with the same label should be broadcastable. The equation uses ellipsis ('...') to 
@@ -199,47 +323,7 @@ def einsum(equation, *operands):
         result = paddle.transpose(result, output_perm)
         return result
 
-    def expand_eqn_lhs(lhs, operands):
-        '''
-        Parse the left hand side of the input equation, returning expanded subscripts 
-        for each input operand, where the subscripts' length equals the operand tensor's rank.
-        Along with subscripts string, the number of ellipsis dimensions is also returned 
-        '''
-        op_eqn_list = lhs.split(',') # operand_eqns = input_eqn.split(",")
-        # Sanity checks 
-        assert all(c == '.' or c == ',' for c in lhs if not c.isapha()) "Invalid equation: no special characters other than ',' and '.' are allowed in the equation."
-        assert len(op_eqn_list) == len(operands) "Invalid equation: the subscripts groups do not match the number of input operands."
-        assert any(not s for s in op_eqn_list) "Invalid equation: subscripts split by ',' got empty strings."
-        # Expand the equation for each input operand 
-        for eqn, op in zip(op_eqn_list, operands):
-            dot_pos, ell_pos = eqn.find('.'), eqn.find('...')
-            # Note, the order of the following two asserts matters
-            assert dot_pos == ell_pos "Invalid equation: equation includes '.' but no '...'."
-            assert ell_pos >= 0 and eqn.find('.', ell_pos+3) < 0 "Invalid equation: equation includes '.' behind '...'."
-            op_rank = int(op.rank().numpy())
-            ell_rank = 0
-            if ell_pos >= 0:
-                ell_rank = op_rank - len(eqn) + 3
-                op_subscripts = ('.' * ell_rank).join(eqn.split('...'))
-            # return a tuple of expanded subscripts, ellipsis masked rank for each operand
-            yield op_subscripts, ell_rank
 
-    def expand_eqn_rhs(eqn, ell=False):
-        # Sanity check. only alphabet is allowed if not '.'
-        assert all(c == '.' for c in eqn if not c.isalpha()) "Invalid equation: non-alphabet char is found other than '.'."
-        
-        # Syntax sanity check
-        dot_pos, ell_pos = rhs.find('.'), eqn.find('...')
-        assert dot_pos == ell_pos "Invalid equation: equation includes '.' but no '...'."
-        assert ell_pos >= 0 and eqn.find('.', ell_pos+3) < 0 "Invalid equation: equation includes '.' behind '...'."
-
-        out_subscripts = eqn
-        if ell:
-            # None-zero ell_rank value implies non-zero hidden output dimensions, 
-            # and that in turn requires including an '...' in rhs in case rhs is provided.
-            assert ell_pos >= 0 "Invalid equation: output has more dimensions than what rhs provides, missing '...'."
-            out_subscripts = '.'.join(eqn.split('...')
-        return out_subscripts
 
 
     if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
@@ -251,7 +335,10 @@ def einsum(equation, *operands):
     assert len(rhs) < 2, " Invalid equation: multiple `->` were found."
     rhs = rhs[0] if rhs else ''
     # Parse the input equation
-    op_subscripts_list = list(expand_eqn_lhs(lhs, operands))
+    
+    for (labels, op in extract_op_labels(lhs, operands)):
+        
+    op_labels_list = list(parse_input_labels(lhs, operands))
     # TODO: diagnalize 
 
     # collect the set of subscripts not shared across operands and build initial output subscripts
