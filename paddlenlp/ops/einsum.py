@@ -75,26 +75,46 @@ def get_implicit_dim_indices_and_shape(op_shape, extended_labels):
         
     return indices, shape
 
-def broadcastable(x_shape, y_shape):
-    if not isinstance(x_shape, list):
-        assert not isinstance(y_shape, list)
-        x_size, y_size = int(x_shape), int(y_shape)
-        assert (not x_size == 0) and (not y_size == 0), "Invalid equation: empty dimension cannot be broadcasted. " 
-        return x_size == 1 or y_size == 1 or x_size == y_size
+def simple_broadcast(dim_bcast_callback, *args):
+    '''
+    Simple broadcast condition, in which case the operands have the same number of dimensions
+    Parameters *args includes four lists of the same length: the dimension indices and sizes of the left and right respectively
+    '''
+    for x_idx, x_size, y_idx, y_size in zip(*args):
+        assert (not x_size == 0) and (not y_size == 0), "Invalid equation: empty dimension cannot be broadcasted. "
+        dim_bcastable = x_size == 1 or y_size == 1 or x_size == y_size
+        if not dim_bcastable:
+            return False
 
-    if len(x_shape) == len(y_shape):
-        if len(x_shape) == 0:
-            return True
-        res = broadcastable(x_shape.pop(), x_shape.pop()) and broadcastable(x_shape, y_shape)
+    for x_idx, x_size, y_idx, y_size in zip(*args):
+        dim_bcast_callback(x_idx, x_size, y_idx, y_size)
+
+    return True                
+
+def broadcast(f, *args):
+    x_indices, x_sizes, y_indices, y_sizes = *args
+    assert len(x_indices) == len(x_sizes)
+    assert len(y_indices) == len(y_sizes)
+
+    if len(x_sizes) == len(y_sizes):
+        res = simple_broadcast(f, args)
         return res
     
-    if len(x_shape) < len(y_shape):
-        x_shape, y_shape = y_shape, x_shape
+    if len(x_sizes) < len(y_sizes):
+        x_sizes, y_sizes = y_sizes, x_sizes
+        x_indices, y_indices = y_indices, x_indices
 
     # Try unsqueeze y's dimensions to the left and then to the right
-    x_shape_l, x_shape_r = x_shape[:-1], x_shape[1:]
-    res = broadcastable(x_shape_l, y_shape) or broadcastable(x_shape_r, y_shape) 
-    return res
+    res = broadcast(f, x_indices[:-1], x_sizes[:-1], y_indices, y_sizes) 
+    if res:
+        f(x_indices[-1], x_sizes[-1], None, None)
+        return True
+    res = broadcast(f, x_indices[1:], x_sizes[1:], y_indices, y_sizes) 
+    if res:
+        f(x_indices[0], x_sizes[0], None, None)
+        return True
+    return False
+    
 
 def collect_avail_labels(labels_list):
     '''
