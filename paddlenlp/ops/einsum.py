@@ -209,6 +209,34 @@ def infer_output_labels(list_op_lables):
     singular_labels = gather_singular_labels(list_op_lables)
     return '.' * n_bcast_dims + singular_labels
 
+def dim_strides(shape):
+    strides = []
+    stride = 1
+    for size in shape[::-1]:
+        strides.append(stride)
+        stride = stride * size
+    return strides
+
+def diagonalize_op(operand, labels):
+
+    orig_strides = dim_strides(operand.shape)
+    out_labels = []
+    orig_idx = []
+    strides = []
+    
+    for i, l in enumerate(labels):
+        oi = out_labels.index(l)
+        if oi < 0:
+            # label first seen
+            out_labels.append(l)
+            orig_idx.append(i)
+            strides.append(orig_strides[i])
+        else:
+            # duplicated label
+            strides[oi] += orig_strides[i]
+
+    # call framework API to build a new tensor
+
 def join(x, y, xlabels, ylabels, out_labels):
     '''
     Joins two tensor operands x and y following the input and output labels
