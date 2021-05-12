@@ -165,19 +165,26 @@ def gather_singular_labels(labels_list, alphabet_only=True):
                 singular_labels.append(l)
             label, count = l, 1
         else:
-            count++
+            count += 1
+    if count == 1:
+        singular_labels.append(all_labels[-1])
 
     return ''.join(singular_labels)
 
 
-def parse_explicit_output_labels(rhs, avail_labels):
+def parse_explicit_output_labels(rhs, avail_labels, n_bcast_dims):
     '''
     Parse explicit output labels given on the right hand side of '->' and the available input labels
     Returns the output labels in a string
     '''
     # Sanity check. Only alphabet is allowed if not '.'
     assert all(c in avail_labels for c in rhs), f"Invalid equation: an output label is expected to be included in the input labels but `{c}` is found."
-    
+
+    # Syntax sanity check. Verify there's no duplicate labels
+    for i, l in enumerate(rhs.replace('.', '')):
+        if rhs.find(l, 0, i) >= 0:
+            assert False, f"Invalid equation: duplicate output label {l}."
+
     if '.' in avail_labels:
         # Syntax sanity check. Verify that dots exist if and only if they show up in an ellipsis
         dot_pos = rhs.find('.')
@@ -185,15 +192,10 @@ def parse_explicit_output_labels(rhs, avail_labels):
         ell_pos, extra_dot = rhs.find('...', dot_pos), rhs.find('.', dot_pos+3)
         assert ell_pos == dot_pos, "Invalid equation: ellipsis is expected but not found."
         assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
-        out_labels = '.'.join(rhs.split('...'))
+        out_labels = ('.'*n_bcast_dims).join(rhs.split('...'))
     else:
         out_labels = rhs
 
-    # Syntax sanity check. Verify there's no duplicate labels
-    label_list = []
-    for c in out_labels:
-        assert not c in label_list, f"Invalid equation: duplicate output label {c}."
-        label_list.append(c)
     return out_labels
 
 def infer_output_labels(list_op_lables):
@@ -204,7 +206,9 @@ def infer_output_labels(list_op_lables):
     '''
     # Broadcast dimensions are output first
     n_bcast_dims = max(num_bcast_dims(labels) for labels in list_op_labels)
-    # 
+    # Followed by singular labels
+    singular_labels = gather_singular_labels(list_op_lables)
+    return '.' * n_bcast_dims + singular_labels
 
 def join(x, y, xlabels, ylabels, out_labels):
     '''
