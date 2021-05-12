@@ -16,16 +16,15 @@ import paddle
 
 __all__ = ['einsum']
 
-def extract_op_labels(lhs, operands):
+def visit_op_labels(lhs, operands):
     '''
     Used a generator to extract the labels, op pair for each operand.  
     '''
-    op_labels_list = lhs.split(',')
     # Sanity checks
-    assert len(op_labels_list) == len(operands), "Invalid equation: the input labels do not match the number of input operands."
-    assert any(not labels for labels in op_labels_list), "Invalid equation: subscripts split by ',' got empty strings."
+    assert lhs.count(',') + 1 == len(operands), "Invalid equation: the input labels do not match the number of input operands."
+    # assert any(not labels for labels in op_labels_list), "Invalid equation: subscripts split by ',' got empty strings."
     # yields a pair of labels, operand
-    yield from zip(op_labels_list, operands)
+    yield from zip(lhs.split(','), operands)
 
 def parse_input_labels(labels, operand):
     '''
@@ -55,13 +54,19 @@ def parse_input_labels(labels, operand):
     # Do we need to handle at this point the trace and diag cases
     return extended_labels
 
-def has_implicit_dims(extended_labels):
+def has_bcast_dims(extended_labels):
     '''
     Returns whether there are non-labeled dimensions by checking the extended labels 
     '''
     return '.' in extended_labels
 
-def get_implicit_dim_indices_and_shape(op_shape, extended_labels):
+def num_bcast_dims(extended_labels):
+    '''
+    Returns the number of broadcast dimensions
+    '''
+    return extended_labels.count('.')
+
+def get_bcast_dim_indices_and_shape(op_shape, extended_labels):
     '''
     Returns the shape of the implicit dimensions indicated by the extended labels
     '''
@@ -70,14 +75,14 @@ def get_implicit_dim_indices_and_shape(op_shape, extended_labels):
     indices, shape = [], []
     for i, size, label in zip(range(len(op_shape)), op_dims, extended_labels):
         if label == '.':
-            indices.append(i);
-            shape.append(size)    
-        
+            indices.append(i)
+            shape.append(size)
+
     return indices, shape
 
-def simple_broadcast(dim_bcast_callback, *args):
+def simple_bcastable_test(dim_bcast_callback, *args):
     '''
-    Simple broadcast condition, in which case the operands have the same number of dimensions
+    Simple broadcastable condition test, in which case the operands have the same number of dimensions
     Parameters *args includes four lists of the same length: the dimension indices and sizes of the left and right respectively
     '''
     for x_idx, x_size, y_idx, y_size in zip(*args):
@@ -91,7 +96,17 @@ def simple_broadcast(dim_bcast_callback, *args):
 
     return True                
 
-def broadcast(f, *args):
+def bcastable_test(f, *args):
+    '''
+    Tests broadcast condition.
+    Parameter f is used as a callback for postprocessing the aligned operand dimensions.
+        f would be invoked with four parameters:
+        the index and size of the selected left operand's dimension, 
+        the index and size of the selected right operand's dimension.
+    Parameter args is unpacked into four variables:
+        the dimension indices and sizes of the left operand,
+        the dimension indices and sizes of the right operand 
+    '''
     x_indices, x_sizes, y_indices, y_sizes = *args
     assert len(x_indices) == len(x_sizes)
     assert len(y_indices) == len(y_sizes)
@@ -105,26 +120,55 @@ def broadcast(f, *args):
         x_indices, y_indices = y_indices, x_indices
 
     # Try unsqueeze y's dimensions to the left and then to the right
-    res = broadcast(f, x_indices[:-1], x_sizes[:-1], y_indices, y_sizes) 
+    res = bcastable_test(f, x_indices[:-1], x_sizes[:-1], y_indices, y_sizes) 
     if res:
         f(x_indices[-1], x_sizes[-1], None, None)
         return True
-    res = broadcast(f, x_indices[1:], x_sizes[1:], y_indices, y_sizes) 
+    res = bcastable_test(f, x_indices[1:], x_sizes[1:], y_indices, y_sizes) 
     if res:
         f(x_indices[0], x_sizes[0], None, None)
         return True
     return False
-    
 
-def collect_avail_labels(labels_list):
+def gather_avail_labels(labels_list):
     '''
-    Returns the union of all available labels in the list
+    Returns the union of all the available labels in the list
     '''
     label_set = set()
-    for labels in labels_list):
+    for labels in labels_list:
         label_set = label_set.update(labels)
     
     return ''.join(label_set)
+
+def gather_singular_labels(labels_list, alphabet_only=True):
+    '''
+    Returns the labels that appear only once
+    Parameter alphabet_only indicates whether to count labels in [a-z] only
+    '''
+    all_labels = sorted(''.join(labels_list))    
+
+    _off = 0
+    if alphabet_only:
+        for i, l in enumerate(all_labels):
+            if l.isalpha():
+                _off = i
+                break
+
+    all_labels = all_labels[_off:]
+
+    singular_labels = []
+    last_label, count = None, 0
+    for l in all_labels:
+        if (l != last_label):
+            # new label, the last label is singular is count is one
+            if count == 1:
+                singular_labels.append(l)
+            label, count = l, 1
+        else:
+            count++
+
+    return ''.join(singular_labels)
+
 
 def parse_explicit_output_labels(rhs, avail_labels):
     '''
@@ -141,7 +185,7 @@ def parse_explicit_output_labels(rhs, avail_labels):
         ell_pos, extra_dot = rhs.find('...', dot_pos), rhs.find('.', dot_pos+3)
         assert ell_pos == dot_pos, "Invalid equation: ellipsis is expected but not found."
         assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
-        out_labels = '.'.join(rhs.split('...')
+        out_labels = '.'.join(rhs.split('...'))
     else:
         out_labels = rhs
 
@@ -152,12 +196,15 @@ def parse_explicit_output_labels(rhs, avail_labels):
         label_list.append(c)
     return out_labels
 
-def infer_output_labels(eqn):
+def infer_output_labels(list_op_lables):
     '''
-    Infer output labels in case no explicit output labels are given on the right hand side of '->' 
+    Infer output labels in case no explicit output labels are given on the right hand side of '->'.
+    The output labels are those that appear only once, put in alphabetical order. 
     Returns the output labels in a string
     '''
-    pass
+    # Broadcast dimensions are output first
+    n_bcast_dims = max(num_bcast_dims(labels) for labels in list_op_labels)
+    # 
 
 def join(x, y, xlabels, ylabels, out_labels):
     '''
@@ -356,9 +403,10 @@ def einsum(equation, *operands):
     rhs = rhs[0] if rhs else ''
     # Parse the input equation
     
-    for (labels, op in extract_op_labels(lhs, operands)):
-        
-    op_labels_list = list(parse_input_labels(lhs, operands))
+    all_extended_op_labels =[]
+    for labels, op in visit_op_labels(lhs, operands):
+        all_extended_op_labels.append(parse_input_labels(labels, op))
+
     # TODO: diagnalize 
 
     # collect the set of subscripts not shared across operands and build initial output subscripts
