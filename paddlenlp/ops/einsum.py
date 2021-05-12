@@ -188,12 +188,11 @@ def parse_explicit_output_labels(rhs, avail_labels, n_bcast_dims):
     if '.' in avail_labels:
         # Syntax sanity check. Verify that dots exist if and only if they show up in an ellipsis
         dot_pos = rhs.find('.')
-        assert ell_pos >= 0, "Invalid equation: more output dimensions should be provided, missing '...'."
         ell_pos, extra_dot = rhs.find('...', dot_pos), rhs.find('.', dot_pos+3)
-        assert ell_pos == dot_pos, "Invalid equation: ellipsis is expected but not found."
-        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
+        assert ell_pos == dot_pos and extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
         out_labels = ('.'*n_bcast_dims).join(rhs.split('...'))
     else:
+        assert n_bcast_dims == 0,  "Invalid equation: more output dimensions than labels, missing '...'."
         out_labels = rhs
 
     return out_labels
