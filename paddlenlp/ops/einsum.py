@@ -217,25 +217,58 @@ def dim_strides(shape):
         stride = stride * size
     return strides
 
-def diagonalize_op(operand, labels):
+def create_op_view(operand, *view_def):
+    '''
+    Create and materialize a view of an operand.
+    
+    Parameters
+    ----------
 
-    orig_strides = dim_strides(operand.shape)
-    out_labels = []
-    orig_idx = []
-    strides = []
+    operand:
+        the base tensor operand
+
+    view_def: 
+        include two lists which define the view's dimension sizes and strides
+    '''
+    view_sizes, view_strides = *view_def
+
+
+
+def diagonalize(operand, labels):
+    '''
+    Merges dimensions with duplicated labels. 
+    
+    For those dimensions with duplicate labels, merge them into one dimension
+    which represents the diagonal elements. That requires the duplicate labeled 
+    dimensions have the same size. The order of dimensions is kept unchanged
+    up to the left-most appearance of each label.
+
+    Examples
+    -------- 
+
+    'ijj...i' would be merged into 'ij...'
+
+    '''
+    op_strides = dim_strides(operand.shape)
+    op_shape = operand.shape
+    new_op_labels = []
+    new_op_sizes = []
+    new_op_strides = []
     
     for i, l in enumerate(labels):
-        oi = out_labels.index(l)
-        if oi < 0:
-            # label first seen
-            out_labels.append(l)
-            orig_idx.append(i)
-            strides.append(orig_strides[i])
+        newi = new_op_labels.index(l)
+        if oi < 0 or l == '.':
+            # not duplicate
+            new_op_labels.append(l)
+            new_op_strides.append(op_strides[i])
+            new_op_sizes.append(op_shape[i])
         else:
             # duplicated label
-            strides[oi] += orig_strides[i]
+            new_op_strides[newi] += op_strides[i]
 
     # call framework API to build a new tensor
+    new_op = create_op_view(operand, new_op_sizes, new_op_strides)
+    return new_op
 
 def join(x, y, xlabels, ylabels, out_labels):
     '''
