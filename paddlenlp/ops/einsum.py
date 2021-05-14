@@ -69,7 +69,7 @@ def parse_op_labels(labels, operand):
     # Sanity checks
     assert all(c in '.' or c.isalpha() for c in labels), f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
     # Expand the labels
-    op_rank = len(op.shape) # Note, in Paddle a tensor rank is always nonzero
+    op_rank = len(operand.shape) # Note, in Paddle a tensor rank is always nonzero
     assert op_rank > 0
 
     dot_pos = labels.find('.')
@@ -130,59 +130,48 @@ def get_bcast_dims_indices_and_shape(op_shape, op_labels):
 
     return indices, shape
 
-def simple_bcastable_test(dim_bcast_callback, *args):
+def bcastable_test(args, f=None):
     '''
-    Simple broadcastable condition test, in which case the operands have the same number of dimensions
-    Parameters *args includes four lists of the same length: the dimension indices and sizes of the left and right respectively
+    Tests if the two operands can perform a broadcast operation on the given ranges of dimensions. 
+    We follow the Numpy broadcasting convention which states that, by lining up the shape arrays
+    starting from the right most dimension, all the aligned dimensions either have equal sizes or
+    one of them is sized one.
+
+    Parameters
+    ----------
+    args:
+        *args unpacks into operand one's axes range, shape, operand two's axes range, shape
+
+    f: 
+        if available, is used as a callback for postprocessing the aligned operand dimensions.
     '''
-    for x_idx, x_size, y_idx, y_size in zip(args):
-        assert (not x_size == 0) and (not y_size == 0), "Invalid equation: empty dimension cannot be broadcasted. "
-        dim_bcastable = x_size == 1 or y_size == 1 or x_size == y_size
-        if not dim_bcastable:
+    xran, xshape, yran, yshape = *args
+
+    xran_inv, yran_inv = xran[::-1], yran[::-1]
+
+    for xi, yi in zip(xran_inv, yran_inv):
+        xs, ys = xshape[xi], yshape[yi]
+        cond = xs == ys or xs == 1 or ys == 1
+        if not cond:
             return False
 
-    for x_idx, x_size, y_idx, y_size in zip(args):
-        dim_bcast_callback(x_idx, x_size, y_idx, y_size)
+    if not f:
+        return True
 
-    return True                
-
-def bcastable_test(f, *args):
-    '''
-    Tests broadcast condition.
-    Parameter f is used as a callback for postprocessing the aligned operand dimensions.
-        f would be invoked with four parameters:
-        the index and size of the selected left operand's dimension, 
-        the index and size of the selected right operand's dimension.
-    Parameter args is unpacked into four variables:
-        the dimension indices and sizes of the left operand,
-        the dimension indices and sizes of the right operand 
-    '''
-    x_indices, x_sizes, y_indices, y_sizes = args
-    assert len(x_indices) == len(x_sizes)
-    assert len(y_indices) == len(y_sizes)
-
-    if len(x_sizes) == len(y_sizes):
-        res = simple_bcastable_test(f, args)
-        return res
-    
-    if len(x_sizes) < len(y_sizes):
-        x_sizes, y_sizes = y_sizes, x_sizes
-        x_indices, y_indices = y_indices, x_indices
-
-    # Try unsqueeze y's dimensions to the left
-    off = len(x_sizes) - len(y_sizes)
-    return bcastable_test(f, x_indices[off:], x_sizes[off:], y_indices, y_sizes) 
+    # Apply the callback to each aligned dimension pair
+    for xi, yi in zip(xran_inv, yran_inv):
+        f(xi, yi)
 
 def gather_avail_labels(labels_list):
     '''
-    Returns the union of all the available labels in the list
+    Returns a sorted string of all the available labels in the list
     '''
     labelset = set()
 
     for _ in visit_op_labels(labelset.update, labels_list):
         pass
     
-    return ''.join(labelset)
+    return ''.join(sorted(labelset))
 
 def gather_singular_labels(labels_list, alphabet_only=True):
     '''
@@ -337,6 +326,9 @@ def diagonalize(labels, operand):
     # call framework API to build a new tensor
     new_op = create_op_view(operand, new_op_sizes, new_op_strides)
     return new_op, new_op_labels
+
+def sort_op_dims(labels, all_labels):
+    
 
 def join(x, y, xlabels, ylabels, out_labels):
     '''
@@ -543,10 +535,10 @@ def einsum(equation, *operands):
     n_bcast_dims = max(visit_op_labels(num_bcast_dims, all_op_labels, operands))
 
     # Get all available labels
-    # e.g. 'ijk' for ['ij', 'i.', '.k']
+    # e.g. '.ijk' for ['ij', 'i.', '.k']
     avail_labels = gather_avail_labels(all_op_labels)
 
-    # Parse and infer the output labels
+    # Parse and infer output labels. The n_bcast_dims of dots would be added for sure.
     if rhs:
         output_labels = parse_output_labels(rhs, avail_labels, n_bcast_dims)
     else:
@@ -556,8 +548,15 @@ def einsum(equation, *operands):
     proprocess = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
     operands, all_op_labels = list(zip(visit_op_labels(proprocess, all_op_labels, operands)))
 
-    # Append output labels with 
-    ext_output_labels = 
+    # Append output labels with all combined labels. There will be not dots left in combined labels.
+    # The labels in the resulting order will be used to guide the axes ordering in the subsequent
+    # operand join operations.  
+    combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
+    all_labels_ordered = output_labels + combined_labels
+
+    # Prepare the callback for building op axes maps
+    op_axes = list(visit_op_labels(lambda labels: sort_op_dims(labels, all_labels_ordered), \
+                                   all_op_labels))
 
     # Actions start here. Sum up the operands following certain order 
     # which is up to an optional order decision algorithm
