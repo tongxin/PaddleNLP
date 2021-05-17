@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from itertools import chain
+import re
 import paddle
 
 __all__ = ['einsum']
@@ -327,7 +329,56 @@ def diagonalize(labels, operand):
     new_op = create_op_view(operand, new_op_sizes, new_op_strides)
     return new_op, new_op_labels
 
-def sort_op_dims(labels, all_labels):
+def inv_map(in_labels, out_labels):
+    '''
+    Build an inverse map of dimension indices. Following prerequisites must hold to make
+    the result meaningful. First, there's no duplicate alphabet labels in either parameters.
+    Second, the broadcast dimensions in out_labels, are at least as many as in in_labels.
+    Third, indices of broadcast dimension are contiguous.
+
+    Parameters
+    ----------
+    in_labels:
+        The dimension labels to map to
+    out_labels:
+        The dimension labels to map from
+    
+
+    Returns
+    -------
+    The inverse map from out_labels to in_labels. The length of the inverse map equals that of
+    out_labels. -1 is filled if there's no matching intput dimension for a specific label.
+
+    Examples
+    --------
+    in_labels = 'ij..', out_labels = '..ji'
+    inv_map = [2, 3, 1, 0]
+
+    in_labels = 'ij..', out_labels = '..kji'
+    inv_map = [2, 3, -1, 1, 0]
+    '''
+    inv_map = [-1] * len(out_labels)
+    
+    # First build the broadcast dimension mapping
+    # Find the broadcast index range in out_labels
+    r = re.search('\.+', out_labels)
+    if r:
+        start, end = r.start(), r.end()
+        s = re.search('\.+', in_labels)
+        # fill the broadcast dimension indices from right to left.
+        if s:
+            inv_map[end:start:-1] = range(s.end(), s.start())
+        
+    # Now work on non-broadcast dimensions 
+    if start:
+        it = chain(range(start), range(end, len(out_labels)))
+    else:
+        it = iter(range(len(out_labels)))
+        
+    for i in it:
+        inv_map[i] = in_labels.Find(out_labels[i])
+
+    return inv_map
     
 
 def join(x, y, xlabels, ylabels, out_labels):
@@ -544,7 +595,7 @@ def einsum(equation, *operands):
     else:
         output_labels = infer_output_labels(all_op_labels, n_bcast_dims)
 
-    # Diagonalize operands in case there are duplicate labels
+    # Replace an operand with its diagonal in case it has duplicate labels
     proprocess = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
     operands, all_op_labels = list(zip(visit_op_labels(proprocess, all_op_labels, operands)))
 
@@ -554,8 +605,8 @@ def einsum(equation, *operands):
     combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
     all_labels_ordered = output_labels + combined_labels
 
-    # Prepare the callback for building op axes maps
-    op_axes = list(visit_op_labels(lambda labels: sort_op_dims(labels, all_labels_ordered), \
+    # Build op axes maps
+    op_axes = list(visit_op_labels(lambda labels: map_op_dims(labels, all_labels_ordered), \
                                    all_op_labels))
 
     # Actions start here. Sum up the operands following certain order 
