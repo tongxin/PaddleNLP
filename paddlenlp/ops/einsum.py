@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import chain
+import itertools
 import re
 import paddle
 
@@ -371,7 +371,7 @@ def inv_map(in_labels, out_labels):
         
     # Now work on non-broadcast dimensions 
     if start:
-        it = chain(range(start), range(end, len(out_labels)))
+        it = itertools.chain(range(start), range(end, len(out_labels)))
     else:
         it = iter(range(len(out_labels)))
         
@@ -379,9 +379,59 @@ def inv_map(in_labels, out_labels):
         inv_map[i] = in_labels.Find(out_labels[i])
 
     return inv_map
-    
 
-def join(x, y, xlabels, ylabels, out_labels):
+def try_align_operands(list_axes_to_align, operands):
+    op_shapes = [op.shape for op in operands]
+    for axes in zip(list_axes_to_align):
+        # axes are a column of nop input dimension axes. -1 represents new axis
+        # all non size-one dimensions must have the same size
+        sizes = []
+        ops = []
+        for axis, op_shape, opi in zip(axes, op_shapes, range(nop)):
+            if axis >= 0 and op_shape[axis] > 1:
+                sizes.append(op_shape[axis])
+                ops.append(opi)
+        for s1, s2, op1, op2 in zip(sizes, sizes[1:], ops, ops[1:]):
+            assert s1 == s2, f'Dimension {axes[ops]} in {operands[op1].name} and dimension {axes[op2]} in {operands[op2].name} do not match in size.'
+
+def nop1_is_identity(in_labels, out_labels):
+    '''
+    Test if the single operator operation is identity operation
+    '''
+    return in_labels == out_labels
+
+def nop1_is_transpose(in_labels, out_labels):
+    '''
+    Test if the single operator operation is transpose operation
+    '''
+    return sorted(in_labels) == sorted(out_labels)
+
+def unop_is_reducesum(inv_dim_map, ndim_out):
+    '''
+    Test if the unary operator operation is a reduce sum operation
+    '''
+    axes_out = inv_dim_map[:ndim_out]
+    return all(x < y for x, y in zip([-1] + axes_out, axes_out))
+
+def binop_can_dot(inv_dim_maps, ndim_out):
+    '''
+    Test if the binary operator operation can be easily turned into a dot operator. The broadcasting
+    condition is assumed to hold given the inverse dimension mappings for both operands.
+    '''
+    axes_aligned = [(x == -1) == (y == -1) for x, y in zip(inv_dim_maps)]
+    if all(axes_aligned):
+        # Translate into paddle operations
+        # [Transpose, dot]
+        # update 
+    else:
+        return False, None
+
+def binop_can_pointwise(inv_dim_maps, ndim_out):
+    pass
+
+def binop_can_bmm(inv_dim_maps, ndim_out, operands):
+
+def join(x, y, *args):
     '''
     Joins two tensor operands x and y following the input and output labels
     Returns [tensor, dimension labels] pair
@@ -404,7 +454,9 @@ def join(x, y, xlabels, ylabels, out_labels):
 
     Finally, the summed result is returned along with its dimension subscripts
     '''
+    xlabels, ylabels, xaxes, yaxes, olabels = args
 
+    
 
 def einsum(equation, *operands):
     r"""
@@ -501,122 +553,75 @@ def einsum(equation, *operands):
         #     [0.39587265, 0.58031243, 0.51824755]]])
     """
 
-    def _mul_sum(left, right, sum_dims):
-        assert left.rank() == right.rank(), "number of rank should be equal."
-        if len(sum_dims) == 0:
-            return left * right
-        sum_dims_set = set(sum_dims)
-        batch_dims = []
-        left_out_dims = []
-        right_out_dims = []
-        batch_size = summed_size = left_size = right_size = 1
-        dim = len(left.shape)
-        for i in range(dim):
-            is_left_summed_dim = left.shape[i] > 1  # not broadcast dim
-            is_right_summed_dim = right.shape[i] > 1
-            if i in sum_dims_set:
-                if is_left_summed_dim and is_right_summed_dim:
-                    assert left.shape[i] == right.shape[
-                        i], "Non-brocast dim should be equal."
-                    summed_size *= left.shape[i]
-                elif is_left_summed_dim:
-                    left = left.sum(axis=i, keepdim=True)
-                elif is_right_summed_dim:
-                    right = right.sum(axis=i, keepdim=True)
-            elif is_left_summed_dim and is_right_summed_dim:
-                assert left.shape[i] == right.shape[
-                    i], "Non-brocast dim should be equal."
-                batch_dims.append(i)
-                batch_size *= left.shape[i]
-            elif is_left_summed_dim:
-                left_out_dims.append(i)
-                left_size *= left.shape[i]
-            else:
-                right_out_dims.append(i)
-                right_size *= right.shape[i]
-        out_shape = [left.shape[i] for i in batch_dims + left_out_dims]
-        out_shape.extend([1] * len(sum_dims))
-        out_shape.extend([right.shape[i] for i in right_out_dims])
+    # if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
+        # operands = operands[0]
+    nop = len(operands)
+    assert nop > 0, "At least one operand is expected."
 
-        left_perm = list(batch_dims)
-        left_perm.extend(left_out_dims)
-        left_perm.extend(sum_dims)
-        left_perm.extend(right_out_dims)
-
-        right_perm = list(batch_dims)
-        right_perm.extend(sum_dims)
-        right_perm.extend(right_out_dims)
-        right_perm.extend(left_out_dims)
-
-        output_perm = [-1] * (len(batch_dims) + len(left_out_dims) +
-                              len(sum_dims) + len(right_out_dims))
-        for i, j in enumerate(batch_dims + left_out_dims + sum_dims +
-                              right_out_dims):
-            output_perm[j] = i
-
-        left = paddle.reshape(
-            paddle.transpose(
-                left, perm=left_perm), (batch_size, left_size, summed_size))
-        right = paddle.reshape(
-            paddle.transpose(
-                right, perm=right_perm), (batch_size, summed_size, right_size))
-        result = paddle.matmul(left, right)
-        result = paddle.reshape(result, out_shape)
-        result = paddle.transpose(result, output_perm)
-        return result
-
-
-
-
-    if len(operands) == 1 and isinstance(operands[0], (list, tuple)):
-        operands = operands[0]
     # Equation is case insensitive
     equation = equation.lower().replace(' ', '')
     # 1. Parse the equation
     lhs, *rhs = equation.split('->') # eqns = equation.split("->")
-    assert len(rhs) < 2, " Invalid equation: multiple `->` were found."
+    assert len(rhs) < 2, "Invalid equation: multiple `->` were found."
     rhs = rhs[0] if rhs else ''
 
     # Parse the input equation and get the list of extended op_labels for all the input operands
     # e.g. ['ij', 'i.', '.k']
-    all_op_labels = parse_all_op_labels(lhs, operands)
+    nop_labels = parse_all_op_labels(lhs, operands)
 
     # Get maximum number of broadcast dimensions
     # e.g. 1 for ['ij', 'i.', '.k']
-    n_bcast_dims = max(visit_op_labels(num_bcast_dims, all_op_labels, operands))
+    n_bcast_dims = max(visit_op_labels(num_bcast_dims, nop_labels, operands))
 
     # Get all available labels
     # e.g. '.ijk' for ['ij', 'i.', '.k']
-    avail_labels = gather_avail_labels(all_op_labels)
+    avail_labels = gather_avail_labels(nop_labels)
 
-    # Parse and infer output labels. The n_bcast_dims of dots would be added for sure.
+    # Parse and infer output labels. The output labels should match the final result.
     if rhs:
         output_labels = parse_output_labels(rhs, avail_labels, n_bcast_dims)
     else:
-        output_labels = infer_output_labels(all_op_labels, n_bcast_dims)
+        output_labels = infer_output_labels(nop_labels, n_bcast_dims)
+
+    # number of output dimensions
+    ndim_out = len(output_labels)
 
     # Replace an operand with its diagonal in case it has duplicate labels
-    proprocess = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
-    operands, all_op_labels = list(zip(visit_op_labels(proprocess, all_op_labels, operands)))
+    visitor = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
+    operands, nop_labels = list(zip(visit_op_labels(visitor, nop_labels, operands)))
 
-    # Append output labels with all combined labels. There will be not dots left in combined labels.
+    # Combined labels are those not in the output. Append n_bcast_dims of dots if necessary
+    combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
+    if '.' in combined_labels and '.' not in output_labels:
+        combined_labels.replace('.', '.' * n_bcast_dims)
+    # Append output labels with all combined labels.
     # The labels in the resulting order will be used to guide the axes ordering in the subsequent
     # operand join operations.  
-    combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
     all_labels_ordered = output_labels + combined_labels
 
-    # Build op axes maps
-    op_axes = list(visit_op_labels(lambda labels: map_op_dims(labels, all_labels_ordered), \
-                                   all_op_labels))
-
-    # Actions start here. Sum up the operands following certain order 
-    # which is up to an optional order decision algorithm
-    work_queue = list()
-    for op_subs, op in zip(op_subscripts_list, operands):
-        work_queue.append([op_subs, op])
+    # Build an inverse map from output+combined labeled dimensions to input labeled dimensions for each operand
+    visitor = lambda labels: inv_map(labels, all_labels_ordered)
+    inv_dim_maps = list(visit_op_labels(visitor, nop_labels))
     
-    subscripts, result = work_queue.pop()
-    while work_queue:
+    # Verify that all aligned dimensions are broadcastable in size across operands
+    try_align_operands(inv_dim_maps, operands)
+
+
+    # Now the actual summations start. A work queue is flexible for performing specialized summations
+    # over variate number of operands.
+    work_queue = list()
+    for axes, op in zip(inv_dim_maps, operands):
+        work_queue.append([axes, op])
+    
+    while True:
+        if len(work_queue) == 1:
+            axes, op = work_queue.pop()
+            break
+        else:
+            axes, op = join()
+            
         subscripts, result = join(subscripts, result, *work_queue.pop())
     
+
+
     return result
