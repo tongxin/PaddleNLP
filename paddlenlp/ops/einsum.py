@@ -329,7 +329,7 @@ def diagonalize(labels, operand):
     new_op = create_op_view(operand, new_op_sizes, new_op_strides)
     return new_op, new_op_labels
 
-def inv_map(in_labels, out_labels):
+def inverse_map(in_labels, out_labels):
     '''
     Build an inverse map of dimension indices. Following prerequisites must hold to make
     the result meaningful. First, there's no duplicate alphabet labels in either parameters.
@@ -376,23 +376,25 @@ def inv_map(in_labels, out_labels):
         it = iter(range(len(out_labels)))
         
     for i in it:
-        inv_map[i] = in_labels.Find(out_labels[i])
+        inv_map[i] = in_labels.find(out_labels[i])
 
     return inv_map
 
-def try_align_operands(list_axes_to_align, operands):
+def align_dims(axes_index):
+    operands, axes_list = zip(*axes_index.items())
     op_shapes = [op.shape for op in operands]
-    for axes in zip(list_axes_to_align):
+    for axes in zip(*axes_list):
         # axes are a column of nop input dimension axes. -1 represents new axis
         # all non size-one dimensions must have the same size
-        sizes = []
-        ops = []
-        for axis, op_shape, opi in zip(axes, op_shapes, range(nop)):
-            if axis >= 0 and op_shape[axis] > 1:
-                sizes.append(op_shape[axis])
-                ops.append(opi)
-        for s1, s2, op1, op2 in zip(sizes, sizes[1:], ops, ops[1:]):
-            assert s1 == s2, f'Dimension {axes[ops]} in {operands[op1].name} and dimension {axes[op2]} in {operands[op2].name} do not match in size.'
+        sizes, ops, op_axes = [], [], []
+        for axis, shape, op in zip(axes, op_shapes, ops):
+            if axis > 0 and shape[axis] > 1:
+                sizes.append(shape[axis])
+                ops.append(op)
+                op_axes.append(axis)
+
+        for s1, s2, ax1, ax2, op1, op2 in zip(sizes, sizes[1:], op_axes, op_axes[1:], ops, ops[1:]):
+            assert s1 == s2, f'Dimension {ax1} in {op1.name} and dimension {ax2} in {op2.name} do not match in size.'
 
 def nop1_is_identity(in_labels, out_labels):
     '''
@@ -406,32 +408,32 @@ def nop1_is_transpose(in_labels, out_labels):
     '''
     return sorted(in_labels) == sorted(out_labels)
 
-def unop_is_reducesum(inv_dim_map, ndim_out):
+def unop_is_reducesum(axes_index, ndim):
     '''
     Test if the unary operator operation is a reduce sum operation
     '''
     axes_out = inv_dim_map[:ndim_out]
     return all(x < y for x, y in zip([-1] + axes_out, axes_out))
 
-def binop_can_dot(inv_dim_maps, ndim_out):
+def binop_dot(x, y, x_perm, x_perm, shape_d0, shape_d1):
     '''
-    Test if the binary operator operation can be easily turned into a dot operator. The broadcasting
-    condition is assumed to hold given the inverse dimension mappings for both operands.
+    If the summation is equivalent to a dot then transform the operands and perform dot. 
+    The broadcasting condition is assumed to hold.
     '''
-    axes_aligned = [(x == -1) == (y == -1) for x, y in zip(inv_dim_maps)]
-    if all(axes_aligned):
-        # Translate into paddle operations
-        # [Transpose, dot]
-        # update 
-    else:
-        return False, None
 
-def binop_can_pointwise(inv_dim_maps, ndim_out):
+    x, y = paddle.transpose(x, x_perm), paddle.transpose(y, y_perm)
+    
+    # Reshape the tensor to 2d 
+    paddle.reshape(x, [shape_d0, shape_d1])
+    paddle.reshape(y, [shape_d0, shape_d1])
+    return paddle.dot(x, y)
+
+def binop_try_pointwise(axes_index, ndim):
     pass
 
-def binop_can_bmm(inv_dim_maps, ndim_out, operands):
+def binop_can_bmm(inv_dim_maps, ndim, operands):
 
-def join(x, y, *args):
+def binop_join(x, y, *args):
     '''
     Joins two tensor operands x and y following the input and output labels
     Returns [tensor, dimension labels] pair
@@ -456,7 +458,46 @@ def join(x, y, *args):
     '''
     xlabels, ylabels, xaxes, yaxes, olabels = args
 
+
+
+def get_binop(x, y, global_axes_index, summation_counter, ndim):
+    '''
+    Get specialized binary summation function, updating the global axes index and summation counter as side effect.
+
+    '''
+    x_axes, y_axes = global_axes_index[x], global_axes_index[y]
+
+    tmp = list((x == -1, y == -1) for x, y in zip(x_axes, y_axes))
+    x_axes_exist, y_axes_exist = zip(*tmp)
+    perfect_aligned = all(x == y for x, y in zip(x_axes_exist, y_axes_exist))
+
+    if perfect_aligned:
+        # check on which dimensions we can perform summation now
+        # This is indicated by that summation counter equals 1
+        summables = list(i for i, c in enumerate(summation_counter if c == 1))
+        
+        x_perm = [[]] * 2
+        y_perm = [[]] * 2
+
+        for i, x_ax, y_ax in zip(range(len(x_axes), x_axes, y_axes)):
+            if x_axes_exist[i]:
+                if i in summables:
+                    x_perm[1].append(x_ax)
+                    y_perm[1].append(y_ax)
+                else:
+                    x_perm[0].append(x_ax)
+                    y_perm[0].append(y_ax)
     
+        if x_perm[1]: # meaning can dot
+            d0 = sum(x.shape[ax] for ax in x_perm[0])
+            d1 = sum(x.shape[ax] for ax in x_perm[1])
+            def dot(x, y):
+                z = binop_dot(x, y, x_perm, y_perm, d0, d1)
+                # update the global axes index
+            return dot
+
+        
+
 
 def einsum(equation, *operands):
     r"""
@@ -594,34 +635,39 @@ def einsum(equation, *operands):
     combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
     if '.' in combined_labels and '.' not in output_labels:
         combined_labels.replace('.', '.' * n_bcast_dims)
+
     # Append output labels with all combined labels.
     # The labels in the resulting order will be used to guide the axes ordering in the subsequent
     # operand join operations.  
-    all_labels_ordered = output_labels + combined_labels
+    all_labels = output_labels + combined_labels
 
-    # Build an inverse map from output+combined labeled dimensions to input labeled dimensions for each operand
-    visitor = lambda labels: inv_map(labels, all_labels_ordered)
-    inv_dim_maps = list(visit_op_labels(visitor, nop_labels))
-    
+    # Build global_axes_index, a data structure that maintains the mapping from all_labels
+    # to the dimensions in the remained operands during the summation process.  
+    visitor = lambda labels: inverse_map(labels, all_labels)
+    global_axes_index = dict(zip(operands, visit_op_labels(visitor, nop_labels)))
+
+    global_ndim = len(global_axes_index)
+    summation_counter = [-1] * global_ndim
+    for axes_index in global_axes_index.values():
+        for i in range(ndim_out, global_ndim):
+        if axes_index[i] != -1:
+            summation_counter[i] += 1
+
     # Verify that all aligned dimensions are broadcastable in size across operands
-    try_align_operands(inv_dim_maps, operands)
-
+    align_dims(global_axes_index):
 
     # Now the actual summations start. A work queue is flexible for performing specialized summations
     # over variate number of operands.
-    work_queue = list()
-    for axes, op in zip(inv_dim_maps, operands):
-        work_queue.append([axes, op])
+    work_queue = list(operands)
     
-    while True:
+    while work_queue:
         if len(work_queue) == 1:
-            axes, op = work_queue.pop()
-            break
+            x = work_queue.pop()
+            z, res_axes = unop_do(x, global_axes_index, ndim_out)
         else:
-            axes, op = join()
-            
-        subscripts, result = join(subscripts, result, *work_queue.pop())
-    
+            x, y = work_queue.pop(), work_queue.pop()
+            z, res_axes = binop_do(x, y, global_axes_index, ndim_out)
+            global_axes_index[z] = res_axes
+            work_queue.append(z)
 
-
-    return result
+    return z
