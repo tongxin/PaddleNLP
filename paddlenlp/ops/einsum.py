@@ -51,7 +51,7 @@ def parse_op_labels(labelstr, operand):
         # return a tuple of expanded labels, with each anonymous dimension dot labeled.
     return extended_labelstr
 
-def parse_all_op_labels(label_str, operands):
+def parse_all(label_str, operands):
     '''
     Parses out labels for all input operands in the label string.
 
@@ -78,7 +78,7 @@ def has_bcast_dims(extended_labels, operand=None):
     '''
     return '.' in extended_labels
 
-def num_bcast_dims(extended_labels, operand=None):
+def count_bcast_dims(extended_labels, operand=None):
     '''
     Returns the number of broadcast dimensions
     '''
@@ -359,7 +359,7 @@ def dims_index(in_labels, out_labels):
 
     return inv_map
 
-def align_dims(axes_index):
+def verify_shape(axes_index):
     operands, axes_list = zip(*axes_index.items())
     op_shapes = [op.shape for op in operands]
     for axes in zip(*axes_list):
@@ -581,31 +581,33 @@ def einsum(equation, *operands):
 
     # Equation is case insensitive
     equation = equation.lower().replace(' ', '')
+
     # 1. Parse the equation
     lhs, *rhs = equation.split('->') # eqns = equation.split("->")
+
     assert len(rhs) < 2, "Invalid equation: multiple `->` were found."
     rhs = rhs[0] if rhs else ''
 
     # Parse the input equation and get the list of extended op_labels for all the input operands
     # e.g. ['ij', 'i.', '.k']
-    nop_labels = parse_all_op_labels(lhs, operands)
+    nop_labels = parse_all(lhs, operands)
 
     # Replace any operand with its diagonal in case it has duplicate labels
     f = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
     operands, nop_labels = list(zip(*map(f, nop_labels, operands)))
 
-    # Get maximum number of broadcast dimensions
+    # Get number of broadcast dimensions
     # e.g. 1 for ['ij', 'i.', '.k']
-    n_bcast_dims = max(map(num_bcast_dims, nop_labels, operands))
+    n_bcast_dims = max(map(count_bcast_dims, nop_labels, operands))
 
-    # Get all available labels
+    # Get the global label string, in which each and every label names each and every aligned dimension
     # e.g. '.ijk' for ['ij', 'i.', '.k']
-    all_labels = gather_labels(nop_labels, n_bcast_dims)
-    ndim = len(all_labels)
+    global_labelstr = gather_labels(nop_labels, n_bcast_dims)
+    ndim = len(global_labelstr)
 
     # Parse or infer output labels.
     if rhs:
-        output_labels = parse_output_labels(rhs, all_labels, n_bcast_dims)
+        output_labels = parse_output_labels(rhs, global_labelstr, n_bcast_dims)
     else:
         output_labels = infer_output_labels(nop_labels, n_bcast_dims)
 
@@ -614,7 +616,7 @@ def einsum(equation, *operands):
 
     # Combined labels are those not in the output. Append n_bcast_dims of dots if necessary
     
-    combined = list(all_labels)
+    combined = list(global_labelstr)
     for l in output_labels:
         combined.remove(l)
 
@@ -623,7 +625,7 @@ def einsum(equation, *operands):
     assert ndim_combined + ndim_out == ndim
 
     # Reorder all_labels to be consistent 
-    all_labels = combined_labels + output_labels
+    global_labelstr = combined_labels + output_labels
 
     # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
@@ -631,16 +633,16 @@ def einsum(equation, *operands):
     global_dims_index = dict(zip(operands, map(f, nop_labels)))
 
     # Verify that all aligned dimensions are broadcastable in size across operands
-    align_dims(global_dims_index)
+    verify_shape(global_dims_index)
 
-    summation_counter = [-1] * ndim_combined
+    # Prepare summation counters for combined dimension
+    summation_counters = [-1] * ndim_combined
     for dims_index in global_dims_index.values():
         for i in range(ndim_combined):
         if dims_index[i] != -1:
-            summation_counter[i] += 1
+            summation_counters[i] += 1
 
-    # Now the actual summations start. A work queue is flexible for performing specialized summations
-    # over variate number of operands.
+    # Actual summations start here.
     work_queue = list(operands)
     
     while work_queue:
