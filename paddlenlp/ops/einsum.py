@@ -18,6 +18,39 @@ import paddle
 
 __all__ = ['einsum']
 
+
+def parse_op_labels(labelstr, operand):
+    '''
+    Parses labels for an input operand.
+
+    Parameters
+    ----------
+    labelstr:
+        the 
+    Returns an extended label string with all missing labels filled as dots
+    '''
+    # Sanity checks
+    assert all(c in '.' for c in labelstr if not c.isalpha()), f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
+    # Expand the labelstr
+    ndims = len(operand.shape) # Note, in Paddle a tensor rank is always nonzero
+    assert ndims > 0
+
+    dot_pos = labelstr.find('.')
+    if dot_pos == -1:
+        # No ellipsis, implying the labelstr should straightly match the operand dimensions
+        assert len(labelstr) == ndims, f"Invalid equation: missing labels for input operand '{operand.name}''."
+        extended_labelstr = labelstr
+    if dot_pos >= 0:
+        ell_pos, extra_dot = labelstr.find('...', dot_pos), labelstr.find('...', dot_pos+3)  
+        # Note, the order of the following two asserts matters
+        assert dot_pos == ell_pos, "Invalid equation: ellipsis is expected but not found."
+        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
+        assert len(labelstr) - 3 <= ndims, "Invalid equation: more labels are found than the available dimensions in operand '{operand.name}'."
+        anon_ndims = ndims - len(labelstr) + 3
+        extended_labelstr = ('.' * anon_ndims).join(labelstr.split('...'))
+        # return a tuple of expanded labels, with each anonymous dimension dot labeled.
+    return extended_labelstr
+
 def parse_all_op_labels(label_str, operands):
     '''
     Parses out labels for all input operands in the label string.
@@ -37,59 +70,7 @@ def parse_all_op_labels(label_str, operands):
     assert label_str.count(',') + 1 == len(operands), "Invalid equation: the input labels do not match the number of input operands."
     # assert any(not labels for labels in op_labels_list), "Invalid equation: subscripts split by ',' got empty strings."
     # yields a pair of labels, operand
-    return [parse_op_labels(op_labels, op) for op_labels, op in zip(label_str.split(','), operands)]
-        
-def visit_op_labels(f, op_labels_list, operands=None):
-    '''
-    Traverse the list of op labels, applying the visitor callback to each along the way.
-    Returns the results in a generator.
-
-    Parameters
-    ----------
-
-    f:
-        the visitor callback
-    
-    op_labels_list:
-        the list of labels.
-
-    operands:
-        the input operands
-    '''
-    if operands:
-        for op_labels, op in zip(op_labels_list, operands):
-            yield f(op_labels, op)
-    else:
-        for op_labels in op_labels_list:
-            yield f(op_labels)
-
-def parse_op_labels(labels, operand):
-    '''
-    Parses labels for an input operand.
-    Returns an extended label string with all missing labels filled as dots
-    '''
-    # Sanity checks
-    assert all(c in '.' or c.isalpha() for c in labels), f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
-    # Expand the labels
-    op_rank = len(operand.shape) # Note, in Paddle a tensor rank is always nonzero
-    assert op_rank > 0
-
-    dot_pos = labels.find('.')
-    if dot_pos == -1:
-        # No ellipsis, implying the labels should straightly match the operand dimensions
-        assert len(labels) == op_rank, f"Invalid equation: missing labels for input operand '{operand.name}''."
-        extended_labels = labels
-    if dot_pos >= 0:
-        ell_pos, extra_dot = labels.find('...', dot_pos), labels.find('...', dot_pos+3)  
-        # Note, the order of the following two asserts matters
-        assert dot_pos == ell_pos, "Invalid equation: ellipsis is expected but not found."
-        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
-        assert len(labels) - 3 <= op_rank, "Invalid equation: more labels are found than the available dimensions in operand '{operand.name}'."
-        ell_rank = op_rank - len(labels) + 3
-        extended_labels = ('.' * ell_rank).join(labels.split('...'))
-        # return a tuple of expanded subscripts, ellipsis masked rank for each operand
-    # Do we need to handle at this point the trace and diag cases
-    return extended_labels
+    return list(map(parse_op_labels, label_str.split(','), operands))
 
 def has_bcast_dims(extended_labels, operand=None):
     '''
@@ -164,16 +145,16 @@ def bcastable_test(args, f=None):
     for xi, yi in zip(xran_inv, yran_inv):
         f(xi, yi)
 
-def gather_avail_labels(labels_list):
+def gather_labels(labels_list, bcast_ndims):
     '''
-    Returns a sorted string of all the available labels in the list
+    Returns a sorted string of all labels in the list
     '''
     labelset = set()
 
-    for _ in visit_op_labels(labelset.update, labels_list):
+    for _ in map(labelset.update, labels_list):
         pass
     
-    return ''.join(sorted(labelset))
+    return ''.join(sorted(labelset)).replace('.', '.' * bcast_ndims)
 
 def gather_singular_labels(labels_list, alphabet_only=True):
     '''
@@ -205,7 +186,6 @@ def gather_singular_labels(labels_list, alphabet_only=True):
         singular_labels.append(all_labels[-1])
 
     return ''.join(singular_labels)
-
 
 def parse_output_labels(rhs, avail_labels, n_bcast_dims):
     '''
@@ -251,9 +231,8 @@ def infer_output_labels(list_op_labels, n_bcast_dims):
     The output labels are those that appear only once, put in alphabetical order. 
     Returns the output labels in a string
     '''
-    output_labels = ''
     # Broadcast labels come first
-    output_labels += '.' * n_bcast_dims
+    output_labels = '.' * n_bcast_dims
     # Followed by singular labels
     output_labels += gather_singular_labels(list_op_labels)
 
@@ -286,7 +265,7 @@ def create_op_view(operand, *view_def):
     view_sizes, view_strides = view_def
     return operand.create_view(view_sizes, view_strides)    
 
-def has_duplicated_labels(labels, *args):
+def has_duplicated_labels(labels):
     '''
     Returns True if there is any duplicate label.
     '''
@@ -329,7 +308,7 @@ def diagonalize(labels, operand):
     new_op = create_op_view(operand, new_op_sizes, new_op_strides)
     return new_op, new_op_labels
 
-def inverse_map(in_labels, out_labels):
+def dims_index(in_labels, out_labels):
     '''
     Build an inverse map of dimension indices. Following prerequisites must hold to make
     the result meaningful. First, there's no duplicate alphabet labels in either parameters.
@@ -494,6 +473,7 @@ def get_binop(x, y, global_axes_index, summation_counter, ndim):
             def dot(x, y):
                 z = binop_dot(x, y, x_perm, y_perm, d0, d1)
                 # update the global axes index
+                
             return dot
 
         
@@ -610,51 +590,54 @@ def einsum(equation, *operands):
     # e.g. ['ij', 'i.', '.k']
     nop_labels = parse_all_op_labels(lhs, operands)
 
+    # Replace any operand with its diagonal in case it has duplicate labels
+    f = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
+    operands, nop_labels = list(zip(*map(f, nop_labels, operands)))
+
     # Get maximum number of broadcast dimensions
     # e.g. 1 for ['ij', 'i.', '.k']
-    n_bcast_dims = max(visit_op_labels(num_bcast_dims, nop_labels, operands))
+    n_bcast_dims = max(map(num_bcast_dims, nop_labels, operands))
 
     # Get all available labels
     # e.g. '.ijk' for ['ij', 'i.', '.k']
-    avail_labels = gather_avail_labels(nop_labels)
+    all_labels = gather_labels(nop_labels, n_bcast_dims)
+    ndim = len(all_labels)
 
-    # Parse and infer output labels. The output labels should match the final result.
+    # Parse or infer output labels.
     if rhs:
-        output_labels = parse_output_labels(rhs, avail_labels, n_bcast_dims)
+        output_labels = parse_output_labels(rhs, all_labels, n_bcast_dims)
     else:
         output_labels = infer_output_labels(nop_labels, n_bcast_dims)
 
     # number of output dimensions
     ndim_out = len(output_labels)
 
-    # Replace an operand with its diagonal in case it has duplicate labels
-    visitor = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
-    operands, nop_labels = list(zip(visit_op_labels(visitor, nop_labels, operands)))
-
     # Combined labels are those not in the output. Append n_bcast_dims of dots if necessary
-    combined_labels = ''.join(c for c in avail_labels if c not in output_labels)
-    if '.' in combined_labels and '.' not in output_labels:
-        combined_labels.replace('.', '.' * n_bcast_dims)
+    
+    combined = list(all_labels)
+    for l in output_labels:
+        combined.remove(l)
 
-    # Append output labels with all combined labels.
-    # The labels in the resulting order will be used to guide the axes ordering in the subsequent
-    # operand join operations.  
-    all_labels = output_labels + combined_labels
+    combined_labels = ''.join(combined)
+    ndim_combined = len(combined_labels)
+    assert ndim_combined + ndim_out == ndim
 
-    # Build global_axes_index, a data structure that maintains the mapping from all_labels
+    # Reorder all_labels to be consistent 
+    all_labels = combined_labels + output_labels
+
+    # Build global_dims_index, a data structure that maintains the mapping from all_labels
     # to the dimensions in the remained operands during the summation process.  
-    visitor = lambda labels: inverse_map(labels, all_labels)
-    global_axes_index = dict(zip(operands, visit_op_labels(visitor, nop_labels)))
-
-    global_ndim = len(global_axes_index)
-    summation_counter = [-1] * global_ndim
-    for axes_index in global_axes_index.values():
-        for i in range(ndim_out, global_ndim):
-        if axes_index[i] != -1:
-            summation_counter[i] += 1
+    f = lambda labels: dims_index(labels, all_labels)
+    global_dims_index = dict(zip(operands, map(f, nop_labels)))
 
     # Verify that all aligned dimensions are broadcastable in size across operands
-    align_dims(global_axes_index):
+    align_dims(global_dims_index)
+
+    summation_counter = [-1] * ndim_combined
+    for dims_index in global_dims_index.values():
+        for i in range(ndim_combined):
+        if dims_index[i] != -1:
+            summation_counter[i] += 1
 
     # Now the actual summations start. A work queue is flexible for performing specialized summations
     # over variate number of operands.
