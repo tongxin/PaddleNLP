@@ -30,47 +30,93 @@ def parse_op_labels(labelstr, operand):
     Returns an extended label string with all missing labels filled as dots
     '''
     # Sanity checks
-    assert all(c in '.' for c in labelstr if not c.isalpha()), f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
-    # Expand the labelstr
+    assert all(c.isalpha() for c in labelstr.replace('.', '')), \
+        f"Invalid equation: a label is expected to be in [a-Z] but found {c}."
+
+    assert labelstr.replace('...', '', 1).find('.') == -1, \
+        f"Invalid equation: `.` is only expected to be included in an ellipsis."
+
+    # Check shape
     ndims = len(operand.shape) # Note, in Paddle a tensor rank is always nonzero
     assert ndims > 0
+    
+    full_labelstr = labelstr.replace('...', '.' * (ndims - len(labelstr) + 3))
 
-    dot_pos = labelstr.find('.')
-    if dot_pos == -1:
-        # No ellipsis, implying the labelstr should straightly match the operand dimensions
-        assert len(labelstr) == ndims, f"Invalid equation: missing labels for input operand '{operand.name}''."
-        extended_labelstr = labelstr
-    if dot_pos >= 0:
-        ell_pos, extra_dot = labelstr.find('...', dot_pos), labelstr.find('...', dot_pos+3)  
-        # Note, the order of the following two asserts matters
-        assert dot_pos == ell_pos, "Invalid equation: ellipsis is expected but not found."
-        assert extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
-        assert len(labelstr) - 3 <= ndims, "Invalid equation: more labels are found than the available dimensions in operand '{operand.name}'."
-        anon_ndims = ndims - len(labelstr) + 3
-        extended_labelstr = ('.' * anon_ndims).join(labelstr.split('...'))
-        # return a tuple of expanded labels, with each anonymous dimension dot labeled.
-    return extended_labelstr
+    assert len(full_labelstr) == ndims, \
+        f"Invalid equation: the label string '{labelstr}' misses dimensions."
 
-def parse_all(label_str, operands):
+    return full_labelstr
+
+def parse_and_count_labels(labelstr, operands):
     '''
-    Parses out labels for all input operands in the label string.
+    Parse out a list of distinct labels and count their number of occurrences.
+    
+    Parameters
+    ----------
+    labelstr:
+        The equation's label string
+    nop:
+        Number of operands
+    
+    Returns
+    -------
+    nop_label:
+        list of full label strings matching the each operand's dimensino size
+    count:
+        the number of occurrences for each label
+    '''
+    # Counters for 26 alphabetical letters
+    count = {label : 0 for label in 'abcdefghijklmnopqrstuvwxyz'}
+    
+    nop_labels = labelstr.split(',')
+    assert len(nop_labels) == len(operands), \
+        f"Invalid equation: the number of operands is {len(operands)} but only found {len(nop_labels)} in the label string."
+    
+    nop_labels = list(map(parse_op_labels, nop_labels, operands))
+
+    for labels in nop_labels:
+        for c in set(labels.replace('.', '')):
+            count[c] += 1
+
+    return nop_labels, count
+
+def parse_output_labels(rhs, avail_labels, n_bcast_dims):
+    '''
+    Parse explicit output labels given on the right hand side of '->' and the available
+    input labels.
 
     Parameters
     ----------
-    label_str:
-        the label string of einsum equation
-    operands:
-        the input operands
+    rhs:
+        the output label string, given by the right hand side of the einsum equation
+    avail_labels:
+        the available labels to check with
+    n_bcast_dims:
+        the number of broadcast dimensions
 
     Returns
     -------
-    A list of parsed labels for all the operands
+    The output labels in a string
     '''
-    # Sanity checks
-    assert label_str.count(',') + 1 == len(operands), "Invalid equation: the input labels do not match the number of input operands."
-    # assert any(not labels for labels in op_labels_list), "Invalid equation: subscripts split by ',' got empty strings."
-    # yields a pair of labels, operand
-    return list(map(parse_op_labels, label_str.split(','), operands))
+    # Sanity check. Only alphabet is allowed if not '.'
+    assert all(c in avail_labels for c in rhs), f"Invalid equation: an output label is expected to be included in the input labels but `{c}` is found."
+
+    # Syntax check. Verify there's no duplicate alphabetical labels
+    for i, l in enumerate(rhs.replace('.', '')):
+        if rhs.find(l, 0, i) >= 0:
+            assert False, f"Invalid equation: duplicate output label {l}."
+
+    # Check there's no dots other than in an ellipsis
+    assert rhs.replace('...', '', 1).find('.') == -1, \
+        f"Invalid equation: `.` is only expected to be included in an ellipsis."
+    
+    # Check if ellipsis is missing
+    assert n_bcast_dims > 0 == rhs.find('...') >= 0, \
+        f"Invalid equation: there are broadcasting dimensions yet found no '...' in the output labels."
+
+    out_labels = rhs.replace('...', '.' * n_bcast_dims, 1) if n_bcast_dims > 0 else rhs
+
+    return out_labels
 
 def has_bcast_dims(extended_labels, operand=None):
     '''
@@ -147,7 +193,7 @@ def bcastable_test(args, f=None):
 
 def gather_labels(labels_list, bcast_ndims):
     '''
-    Returns a sorted string of all labels in the list
+    Returns a sorted string of all labels in the list including dots 
     '''
     labelset = set()
 
@@ -187,45 +233,9 @@ def gather_singular_labels(labels_list, alphabet_only=True):
 
     return ''.join(singular_labels)
 
-def parse_output_labels(rhs, avail_labels, n_bcast_dims):
-    '''
-    Parse explicit output labels given on the right hand side of '->' and the available
-    input labels.
 
-    Parameters
-    ----------
-    rhs:
-        the output label string, given by the right hand side of the einsum equation
-    avail_labels:
-        the available labels to check with
-    n_bcast_dims:
-        the number of broadcast dimensions
 
-    Returns
-    -------
-    The output labels in a string
-    '''
-    # Sanity check. Only alphabet is allowed if not '.'
-    assert all(c in avail_labels for c in rhs), f"Invalid equation: an output label is expected to be included in the input labels but `{c}` is found."
-
-    # Syntax sanity check. Verify there's no duplicate labels
-    for i, l in enumerate(rhs.replace('.', '')):
-        if rhs.find(l, 0, i) >= 0:
-            assert False, f"Invalid equation: duplicate output label {l}."
-
-    if '.' in avail_labels:
-        # Syntax sanity check. Verify that dots exist if and only if they show up in an ellipsis
-        dot_pos = rhs.find('.')
-        ell_pos, extra_dot = rhs.find('...', dot_pos), rhs.find('.', dot_pos+3)
-        assert ell_pos == dot_pos and extra_dot == -1, "Invalid equation: `.` is only expected to be included in an ellipsis."
-        out_labels = ('.'*n_bcast_dims).join(rhs.split('...'))
-    else:
-        assert n_bcast_dims == 0,  "Invalid equation: more output dimensions than labels, missing '...'."
-        out_labels = rhs
-
-    return out_labels
-
-def infer_output_labels(list_op_labels, n_bcast_dims):
+def infer_output_labels(label_count, n_bcast_dims):
     '''
     Infer output labels in case no explicit output labels are given on the right hand side of '->'.
     The output labels are those that appear only once, put in alphabetical order. 
@@ -234,7 +244,8 @@ def infer_output_labels(list_op_labels, n_bcast_dims):
     # Broadcast labels come first
     output_labels = '.' * n_bcast_dims
     # Followed by singular labels
-    output_labels += gather_singular_labels(list_op_labels)
+    singular_labels = list(l for l, cnt in label_count.items() if cnt == 1)
+    output_labels += ''.join(sorted(singular_labels))
 
     return output_labels
 
@@ -476,8 +487,52 @@ def get_binop(x, y, global_axes_index, summation_counter, ndim):
                 
             return dot
 
-        
+def labels_to_axes(labelstr, labels):
+    return [i for i, l in enumerate(labelstr) if l in labels]
 
+class Plan:
+    def __init__(self):
+        opr_vars = []
+        steps = []
+
+    def add_step(self, step):
+        steps.append(step)
+
+def plan_einsum_operations(operands, nop_labels, output_labels, label_count):
+    '''
+    Plans the actual execution steps for this einsum request.
+
+    Parameters
+    ----------
+    
+    Results
+    -------
+    a list of functions with arguments to apply to
+    '''
+    residue_labels = []
+    plan = Plan()
+
+    for var, labels in zip(operands, nop_labels):
+        # plan a single step
+        # find which dimensions are ready to be combined or reduced
+        #    Relevant labels are those which are 1) not in output and 2) in this operand
+        to_reduce, to_fold = []
+
+        for l in labels.replace('.', ''):
+            if l not in output_labels and label_count[l] == 1:
+                if l in residue_labels:
+                    to_fold.append(l)
+                else:
+                    to_reduce.append(l)
+
+        # there are dimensions to reduce
+        if to_reduce:
+            f = paddle.sum
+            axes = labels_to_axes(labels, to_reduce)
+            step = [f, var, axes]
+            plan.add_step(step)
+
+        # there are dimensions to fold
 
 def einsum(equation, *operands):
     r"""
@@ -588,9 +643,9 @@ def einsum(equation, *operands):
     assert len(rhs) < 2, "Invalid equation: multiple `->` were found."
     rhs = rhs[0] if rhs else ''
 
-    # Parse the input equation and get the list of extended op_labels for all the input operands
-    # e.g. ['ij', 'i.', '.k']
-    nop_labels = parse_all(lhs, operands)
+    # Parse and expand the label string to full dimension size for each operand.
+    # Count the number of occurrences for each label
+    nop_labels, label_count = parse_and_count_labels(lhs, operands)
 
     # Replace any operand with its diagonal in case it has duplicate labels
     f = lambda l, o: diagonalize(l, o) if has_duplicated_labels(l) else (l, o)
@@ -600,25 +655,39 @@ def einsum(equation, *operands):
     # e.g. 1 for ['ij', 'i.', '.k']
     n_bcast_dims = max(map(count_bcast_dims, nop_labels, operands))
 
+    # Parse or infer output labels.
+    if rhs:
+        output_labels = parse_output_labels(rhs, list(label_count.keys()), n_bcast_dims)
+    else:
+        output_labels = infer_output_labels(nop_labels, n_bcast_dims)
+
+    # Combined labels are those not in the output
+    combined_ = label_count.keys()
+    for l in output_labels:
+        combined.remove(l)    
+
+    # Build up an operation plan
+    args = [operands, nop_labels, output_labels, label_count]
+    plan = plan_einsum_operations(*args)
+
+    for f, *args in plan:
+        result_vars.append(f(*args))
+
+    return result_var
+
+
+
     # Get the global label string, in which each and every label names each and every aligned dimension
     # e.g. '.ijk' for ['ij', 'i.', '.k']
     global_labelstr = gather_labels(nop_labels, n_bcast_dims)
     ndim = len(global_labelstr)
 
-    # Parse or infer output labels.
-    if rhs:
-        output_labels = parse_output_labels(rhs, global_labelstr, n_bcast_dims)
-    else:
-        output_labels = infer_output_labels(nop_labels, n_bcast_dims)
+
 
     # number of output dimensions
     ndim_out = len(output_labels)
 
-    # Combined labels are those not in the output. Append n_bcast_dims of dots if necessary
-    
-    combined = list(global_labelstr)
-    for l in output_labels:
-        combined.remove(l)
+
 
     combined_labels = ''.join(combined)
     ndim_combined = len(combined_labels)
